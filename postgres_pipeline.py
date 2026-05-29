@@ -7,6 +7,7 @@ class Pipeline:
         self.name = "PostgreSQL Agent"
         self.conn = None
         self.schema_cache = None
+        self.tables_list = None
 
     async def on_startup(self):
         self.conn = psycopg2.connect(
@@ -17,10 +18,23 @@ class Pipeline:
             port=5432
         )
         self.schema_cache = self.get_schema()
+        self.tables_list = self.get_tables_list()
 
     async def on_shutdown(self):
         if self.conn:
             self.conn.close()
+
+    def get_tables_list(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema NOT IN ('pg_catalog','information_schema')
+            AND table_type = 'BASE TABLE'
+            ORDER BY table_name;
+        """)
+        tables = [row[0] for row in cur.fetchall()]
+        cur.close()
+        return tables
 
     def get_schema(self):
         cur = self.conn.cursor()
@@ -44,6 +58,12 @@ class Pipeline:
             schema.append(f"{table}({col_str})")
         cur.close()
         return "\n".join(schema)
+
+    def is_schema_question(self, text):
+        keywords = ["таблиц", "список таблиц", "какие таблицы", 
+                   "что есть в базе", "структура", "схема базы"]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
 
     def ask_sqlcoder(self, user_query):
         prompt = f"""### Database schema:
@@ -80,6 +100,12 @@ SELECT"""
     ) -> Union[str, Generator, Iterator]:
 
         try:
+            # Если спрашивают про таблицы — отвечаем сразу без SQLcoder
+            if self.is_schema_question(user_message):
+                result = f"В базе {len(self.tables_list)} таблиц:\n\n"
+                result += "\n".join(self.tables_list)
+                return result
+
             sql = self.ask_sqlcoder(user_message)
             cur = self.conn.cursor()
             cur.execute(sql)
