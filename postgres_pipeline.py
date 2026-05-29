@@ -16,7 +16,6 @@ class Pipeline:
             host="host.docker.internal",
             port=5432
         )
-        # Читаем схему ОДИН РАЗ при старте
         self.schema_cache = self.get_schema()
 
     async def on_shutdown(self):
@@ -25,7 +24,6 @@ class Pipeline:
 
     def get_schema(self):
         cur = self.conn.cursor()
-        # Берём только первые 30 таблиц чтобы не перегружать модель
         cur.execute("""
             SELECT table_name FROM information_schema.tables 
             WHERE table_schema NOT IN ('pg_catalog','information_schema')
@@ -57,7 +55,7 @@ SQL:"""
         response = requests.post(
             "http://host.docker.internal:11434/api/generate",
             json={
-                "model": "sqlcoder:latest",
+                "model": "sqlcoder:7b",
                 "prompt": prompt,
                 "stream": False,
                 "temperature": 0.0,
@@ -87,7 +85,7 @@ SQL:"""
 
             if cur.description:
                 columns = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()[:50]  # максимум 50 строк
+                rows = cur.fetchall()[:50]
                 result = f"`{sql}`\n\n"
                 result += " | ".join(columns) + "\n"
                 result += "-" * 40 + "\n"
