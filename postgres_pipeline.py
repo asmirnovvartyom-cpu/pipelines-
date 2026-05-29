@@ -60,7 +60,7 @@ class Pipeline:
         return "\n".join(schema)
 
     def is_schema_question(self, text):
-        keywords = ["таблиц", "список таблиц", "какие таблицы", 
+        keywords = ["таблиц", "список таблиц", "какие таблицы",
                    "что есть в базе", "структура", "схема базы"]
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
@@ -69,8 +69,16 @@ class Pipeline:
         prompt = f"""### Database schema:
 {self.schema_cache}
 
+### Rules:
+- Use PostgreSQL 9.3 syntax only
+- Never use to_number(), to_char() on integer/smallint columns
+- For integer comparisons use direct values: WHERE section = 5
+- For checking multiple values use IN: WHERE section IN (0, 1)
+- Use subqueries or GROUP BY instead of to_number()
+- Always start with SELECT
+
 ### Task: {user_query}
-### PostgreSQL 9.3 query (SELECT only, no explanations):
+### PostgreSQL 9.3 query:
 SELECT"""
 
         response = requests.post(
@@ -100,7 +108,6 @@ SELECT"""
     ) -> Union[str, Generator, Iterator]:
 
         try:
-            # Если спрашивают про таблицы — отвечаем сразу без SQLcoder
             if self.is_schema_question(user_message):
                 result = f"В базе {len(self.tables_list)} таблиц:\n\n"
                 result += "\n".join(self.tables_list)
