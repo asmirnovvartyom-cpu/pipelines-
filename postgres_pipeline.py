@@ -46,16 +46,12 @@ class Pipeline:
         return "\n".join(schema)
 
     def ask_sqlcoder(self, user_query):
-        prompt = f"""Ты SQL эксперт. Генерируй только корректный PostgreSQL 9.3 синтаксис.
-Всегда начинай запрос с SELECT, INSERT, UPDATE или DELETE.
-Никогда не пиши просто COUNT(*) без SELECT.
-Не добавляй пояснений — только SQL.
-
-Таблицы:
+        prompt = f"""### Database schema:
 {self.schema_cache}
 
-Запрос пользователя: "{user_query}"
-Сгенерируй только SQL запрос:"""
+### Task: {user_query}
+### PostgreSQL 9.3 query (SELECT only, no explanations):
+SELECT"""
 
         response = requests.post(
             "http://host.docker.internal:11434/api/generate",
@@ -67,7 +63,7 @@ class Pipeline:
                 "options": {"num_ctx": 2048}
             }
         )
-        sql = response.json()["response"].strip()
+        sql = "SELECT " + response.json()["response"].strip()
         if "```" in sql:
             parts = sql.split("```")
             sql = parts[1] if len(parts) > 1 else parts[0]
@@ -103,4 +99,4 @@ class Pipeline:
 
         except Exception as e:
             self.conn.rollback()
-            return f"Ошибка: {str(e)}\n\nSQL который пытался выполнить: {sql if 'sql' in locals() else 'не сгенерирован'}"
+            return f"Ошибка: {str(e)}\n\nSQL: {sql if 'sql' in locals() else 'не сгенерирован'}"
