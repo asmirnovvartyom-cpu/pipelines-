@@ -1,136 +1,234 @@
-from typing import List, Union, Generator, Iterator
+from typing import List
 import psycopg2
 import requests
+import re
+
 
 class Pipeline:
     def __init__(self):
-        self.name = "PostgreSQL Agent"
-        self.conn = None
-        self.schema_cache = None
-        self.tables_list = None
+        self.name = "PostgreSQL PRO Agent"
+        self.schema = {}
+        self.table_priority = []
+
+    # ================= INIT =================
 
     async def on_startup(self):
-        self.conn = psycopg2.connect(
+        conn = self.get_conn()
+        self.schema = self.load_schema(conn)
+        self.table_priority = self.detect_priority_tables()
+        conn.close()
+
+    def get_conn(self):
+        conn = psycopg2.connect(
             dbname="p_829_1_UVAO",
             user="Natasha",
             password="",
             host="host.docker.internal",
             port=5432
         )
-        self.schema_cache = self.get_schema()
-        self.tables_list = self.get_tables_list()
+        conn.autocommit = True  # 🔥 фикс транзакций
+        return conn
 
-    async def on_shutdown(self):
-        if self.conn:
-            self.conn.close()
+    # ================= SCHEMA =================
 
-    def get_tables_list(self):
-        cur = self.conn.cursor()
+    def load_schema(self, conn):
+        cur = conn.cursor()
         cur.execute("""
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-            AND table_type = 'BASE TABLE'
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
             ORDER BY table_name;
         """)
-        tables = [row[0] for row in cur.fetchall()]
+
+        schema = {}
+        for t, c in cur.fetchall():
+            schema.setdefault(t, []).append(c)
+
         cur.close()
-        return tables
+        return schema
 
-    def get_schema(self):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-            AND table_type = 'BASE TABLE'
-            ORDER BY table_name LIMIT 30;
-        """)
-        tables = [row[0] for row in cur.fetchall()]
-        schema = []
-        for table in tables:
-            cur.execute("""
-                SELECT column_name, data_type 
-                FROM information_schema.columns 
-                WHERE table_name = %s 
-                ORDER BY ordinal_position LIMIT 10;
-            """, (table,))
-            cols = cur.fetchall()
-            col_str = ", ".join(f"{c[0]}" for c in cols)
-            schema.append(f"{table}({col_str})")
-        cur.close()
-        return "\n".join(schema)
+    def detect_priority_tables(self):
+        priority = []
+        for t in self.schema:
+            name = t.lower()
+            if any(k in name for k in ["citizen", "person", "people", "human", "individual"]):
+                priority.append(t)
+        return priority if priority else list(self.schema.keys())
 
-    def is_schema_question(self, text):
-        keywords = ["таблиц", "список таблиц", "какие таблицы",
-                   "что есть в базе", "структура", "схема базы"]
-        text_lower = text.lower()
-        return any(k in text_lower for k in keywords)
+    # ================= ROUTER =================
 
-    def ask_sqlcoder(self, user_query):
-        prompt = f"""### Database schema:
-{self.schema_cache}
+    def is_db_query(self, text):
+        keywords = [
+            "покажи", "найди", "записи",
+            "таблица", "база", "данные",
+            "сколько", "фамилия", "адрес"
+        ]
+        return any(k in text.lower() for k in keywords)
 
-### Rules:
-- Use PostgreSQL 9.3 syntax only
-- Never use to_number(), to_char() on integer/smallint columns
-- For integer comparisons use direct values: WHERE section = 5
-- For checking multiple values use IN: WHERE section IN (0, 1)
-- Use subqueries or GROUP BY instead of to_number()
-- Always start with SELECT
+    # ================= NORMALIZE =================
 
-### Task: {user_query}
-### PostgreSQL 9.3 query:
-SELECT"""
+    def normalize(self, text):
+        mapping = {
+            "люди": "citizen",
+            "человек": "citizen",
+            "призывники": "citizen",
+            "адрес": "address",
+            "документы": "document"
+        }
 
-        response = requests.post(
+        text = text.lower()
+
+        for k, v in mapping.items():
+            if k in text:
+                text += f" {v}"
+
+        return text
+
+    # ================= SQL GENERATION =================
+
+    def generate_sql(self, query):
+        schema_text = "\n".join(
+            f"{t}({', '.join(cols[:5])})"
+            for t, cols in list(self.schema.items())[:20]
+        )
+
+        prompt = f"""
+You are PostgreSQL expert.
+
+Schema:
+{schema_text}
+
+Rules:
+- ONLY SQL
+- ONLY SELECT
+- NO explanations
+- LIMIT 50
+- Use real table names only
+
+Task:
+{query}
+
+SQL:
+SELECT
+"""
+
+        r = requests.post(
             "http://host.docker.internal:11434/api/generate",
             json={
-                "model": "sqlcoder:7b",
+                "model": "deepseek-coder:6.7b",
                 "prompt": prompt,
                 "stream": False,
-                "temperature": 0.0,
-                "options": {"num_ctx": 2048}
+                "temperature": 0,
+                "num_predict": 120
             }
         )
-        sql = "SELECT " + response.json()["response"].strip()
-        if "```" in sql:
-            parts = sql.split("```")
-            sql = parts[1] if len(parts) > 1 else parts[0]
-            if sql.startswith("sql"):
-                sql = sql[3:]
+
+        sql = r.json()["response"]
+
+        # 🔥 ЖЕСТКАЯ очистка мусора
+        sql = sql.replace("<s>", "").replace("</s>", "")
+        sql = re.sub(r"Cached.*", "", sql)
+        sql = re.sub(r"```.*?```", "", sql, flags=re.S)
+
+        match = re.search(r"(SELECT .*?)(;|\n|$)", sql, re.S | re.I)
+        if match:
+            sql = match.group(1)
+        else:
+            return None
+
         return sql.strip()
 
-    def pipe(
-        self,
-        user_message: str,
-        model_id: str,
-        messages: List[dict],
-        body: dict
-    ) -> Union[str, Generator, Iterator]:
+    # ================= VALIDATION =================
+
+    def is_valid(self, sql):
+        if not sql:
+            return False
+
+        s = sql.lower()
+
+        if not s.startswith("select"):
+            return False
+
+        if " from " not in s:
+            return False
+
+        tables = re.findall(r'from\s+([a-zA-Z0-9_]+)', s)
+
+        for t in tables:
+            if t not in self.schema:
+                return False
+
+        return True
+
+    # ================= FALLBACK =================
+
+    def fallback_query(self, user_message):
+        msg = user_message.lower()
+
+        # если спрашивают "сколько"
+        if "сколько" in msg:
+            t = self.table_priority[0]
+            return f"SELECT COUNT(*) FROM {t}"
+
+        # если "люди"
+        if "люди" in msg or "человек" in msg:
+            t = self.table_priority[0]
+            return f"SELECT * FROM {t} LIMIT 10"
+
+        # дефолт
+        t = self.table_priority[0]
+        return f"SELECT * FROM {t} LIMIT 5"
+
+    # ================= MAIN =================
+
+    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict):
+
+        # 👉 НЕ БД → не трогаем
+        if not self.is_db_query(user_message):
+            return None
 
         try:
-            if self.is_schema_question(user_message):
-                result = f"В базе {len(self.tables_list)} таблиц:\n\n"
-                result += "\n".join(self.tables_list)
-                return result
+            conn = self.get_conn()
+            cur = conn.cursor()
 
-            sql = self.ask_sqlcoder(user_message)
-            cur = self.conn.cursor()
+            # список таблиц
+            if "таблиц" in user_message.lower():
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema='public'
+                    LIMIT 100
+                """)
+                res = "\n".join(r[0] for r in cur.fetchall())
+                cur.close()
+                conn.close()
+                return res
+
+            user_message = self.normalize(user_message)
+
+            sql = self.generate_sql(user_message)
+
+            if not self.is_valid(sql):
+                sql = self.fallback_query(user_message)
+
+            print("FINAL SQL:", sql)
+
             cur.execute(sql)
 
-            if cur.description:
-                columns = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()[:50]
-                result = f"`{sql}`\n\n"
-                result += " | ".join(columns) + "\n"
-                result += "-" * 40 + "\n"
-                for row in rows:
-                    result += " | ".join(str(x) for x in row) + "\n"
-                return result
-            else:
-                self.conn.commit()
-                return f"`{sql}`\n\nВыполнено успешно."
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+
+            result = f"`{sql}`\n\n"
+            result += " | ".join(cols) + "\n"
+            result += "-" * 50 + "\n"
+
+            for r in rows[:50]:
+                result += " | ".join(str(x) for x in r) + "\n"
+
+            cur.close()
+            conn.close()
+
+            return result
 
         except Exception as e:
-            self.conn.rollback()
-            return f"Ошибка: {str(e)}\n\nSQL: {sql if 'sql' in locals() else 'не сгенерирован'}"
-
+            return f"Ошибка: {str(e)}"
