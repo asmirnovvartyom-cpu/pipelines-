@@ -1,135 +1,250 @@
 from typing import List, Union, Generator, Iterator
 import psycopg2
 import requests
+import re
 
 class Pipeline:
-    def __init__(self):
-        self.name = "PostgreSQL Agent"
-        self.conn = None
-        self.schema_cache = None
-        self.tables_list = None
+def **init**(self):
+self.name = "PostgreSQL Smart Agent"
+self.conn = None
+self.full_schema = None
 
-    async def on_startup(self):
-        self.conn = psycopg2.connect(
-            dbname="p_829_1_UVAO",
-            user="Natasha",
-            password="",
-            host="host.docker.internal",
-            port=5432
-        )
-        self.schema_cache = self.get_schema()
-        self.tables_list = self.get_tables_list()
+```
+async def on_startup(self):
+    self.conn = psycopg2.connect(
+        dbname="p_829_1_UVAO",
+        user="Natasha",
+        password="",
+        host="host.docker.internal",
+        port=5432
+    )
+    self.full_schema = self.load_full_schema()
 
-    async def on_shutdown(self):
-        if self.conn:
-            self.conn.close()
+async def on_shutdown(self):
+    if self.conn:
+        self.conn.close()
 
-    def get_tables_list(self):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-            AND table_type = 'BASE TABLE'
-            ORDER BY table_name;
-        """)
-        tables = [row[0] for row in cur.fetchall()]
-        cur.close()
-        return tables
+# ---------- SCHEMA ----------
+def load_full_schema(self):
+    cur = self.conn.cursor()
+    cur.execute("""
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        ORDER BY table_name, ordinal_position;
+    """)
 
-    def get_schema(self):
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema NOT IN ('pg_catalog','information_schema')
-            AND table_type = 'BASE TABLE'
-            ORDER BY table_name LIMIT 30;
-        """)
-        tables = [row[0] for row in cur.fetchall()]
-        schema = []
-        for table in tables:
-            cur.execute("""
-                SELECT column_name, data_type 
-                FROM information_schema.columns 
-                WHERE table_name = %s 
-                ORDER BY ordinal_position LIMIT 10;
-            """, (table,))
-            cols = cur.fetchall()
-            col_str = ", ".join(f"{c[0]}" for c in cols)
-            schema.append(f"{table}({col_str})")
-        cur.close()
-        return "\n".join(schema)
+    schema = {}
+    for table, column, dtype in cur.fetchall():
+        schema.setdefault(table, []).append(f"{column}({dtype})")
 
-    def is_schema_question(self, text):
-        keywords = ["таблиц", "список таблиц", "какие таблицы",
-                   "что есть в базе", "структура", "схема базы"]
-        text_lower = text.lower()
-        return any(k in text_lower for k in keywords)
+    cur.close()
+    return schema
 
-    def ask_sqlcoder(self, user_query):
-        prompt = f"""### Database schema:
-{self.schema_cache}
+def format_schema(self, tables):
+    result = []
+    for t in tables:
+        if t in self.full_schema:
+            cols = ", ".join(self.full_schema[t][:20])
+            result.append(f"{t}: {cols}")
+    return "\n".join(result)
 
-### Rules:
-- Use PostgreSQL 9.3 syntax only
-- Never use to_number(), to_char() on integer/smallint columns
-- For integer comparisons use direct values: WHERE section = 5
-- For checking multiple values use IN: WHERE section IN (0, 1)
-- Use subqueries or GROUP BY instead of to_number()
-- Always start with SELECT
+# ---------- TABLE SELECTION ----------
+def select_relevant_tables(self, user_query):
+    tables = list(self.full_schema.keys())[:100]
 
-### Task: {user_query}
-### PostgreSQL 9.3 query:
-SELECT"""
+    prompt = f"""
+```
 
-        response = requests.post(
-            "http://host.docker.internal:11434/api/generate",
-            json={
-                "model": "sqlcoder:7b",
-                "prompt": prompt,
-                "stream": False,
-                "temperature": 0.0,
-                "options": {"num_ctx": 2048}
-            }
-        )
-        sql = "SELECT " + response.json()["response"].strip()
-        if "```" in sql:
-            parts = sql.split("```")
-            sql = parts[1] if len(parts) > 1 else parts[0]
-            if sql.startswith("sql"):
-                sql = sql[3:]
-        return sql.strip()
+You are a database expert.
 
-    def pipe(
-        self,
-        user_message: str,
-        model_id: str,
-        messages: List[dict],
-        body: dict
-    ) -> Union[str, Generator, Iterator]:
+Tables:
+{", ".join(tables)}
 
+User question:
+{user_query}
+
+Return ONLY a comma separated list of table names that are relevant.
+"""
+
+```
+    response = requests.post(
+        "http://host.docker.internal:11434/api/generate",
+        json={
+            "model": "sqlcoder:7b",
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.0
+        }
+    )
+
+    text = response.json()["response"].lower()
+    selected = []
+
+    for t in tables:
+        if t.lower() in text:
+            selected.append(t)
+
+    return selected[:5] if selected else tables[:3]
+
+# ---------- SAMPLE DATA ----------
+def get_sample_data(self, tables):
+    cur = self.conn.cursor()
+    samples = []
+
+    for t in tables[:3]:
         try:
-            if self.is_schema_question(user_message):
-                result = f"В базе {len(self.tables_list)} таблиц:\n\n"
-                result += "\n".join(self.tables_list)
-                return result
+            cur.execute(f"SELECT * FROM {t} LIMIT 3;")
+            rows = cur.fetchall()
+            samples.append(f"{t} sample: {rows}")
+        except:
+            continue
 
-            sql = self.ask_sqlcoder(user_message)
+    cur.close()
+    return "\n".join(samples)
+
+# ---------- SQL GENERATION ----------
+def generate_sql(self, user_query, schema, samples):
+    prompt = f"""
+```
+
+You are a PostgreSQL expert.
+
+Schema:
+{schema}
+
+Samples:
+{samples}
+
+Rules:
+
+* ONLY SELECT
+* NO DELETE, UPDATE, INSERT
+* Use JOIN explicitly
+* Use LIMIT 50
+* PostgreSQL 9.3
+
+User question:
+{user_query}
+
+SQL:
+SELECT
+"""
+
+````
+    response = requests.post(
+        "http://host.docker.internal:11434/api/generate",
+        json={
+            "model": "sqlcoder:7b",
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.0
+        }
+    )
+
+    sql = "SELECT " + response.json()["response"].strip()
+
+    if "```" in sql:
+        sql = sql.split("```")[1]
+
+    return sql.strip()
+
+# ---------- VALIDATION ----------
+def is_safe_sql(self, sql):
+    banned = ["insert", "update", "delete", "drop", "alter"]
+    sql_lower = sql.lower()
+    return not any(b in sql_lower for b in banned)
+
+# ---------- AUTO FIX ----------
+def fix_sql(self, bad_sql, error):
+    prompt = f"""
+````
+
+Fix this PostgreSQL query.
+
+Query:
+{bad_sql}
+
+Error:
+{error}
+
+Return ONLY fixed SQL:
+"""
+
+```
+    response = requests.post(
+        "http://host.docker.internal:11434/api/generate",
+        json={
+            "model": "sqlcoder:7b",
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.0
+        }
+    )
+
+    return response.json()["response"].strip()
+
+# ---------- MAIN PIPE ----------
+def pipe(
+    self,
+    user_message: str,
+    model_id: str,
+    messages: List[dict],
+    body: dict
+) -> Union[str, Generator, Iterator]:
+
+    try:
+        # 1. найти таблицы
+        tables = self.select_relevant_tables(user_message)
+
+        # 2. собрать схему
+        schema = self.format_schema(tables)
+
+        # 3. взять примеры данных
+        samples = self.get_sample_data(tables)
+
+        # 4. сгенерить SQL
+        sql = self.generate_sql(user_message, schema, samples)
+
+        print("SQL:", sql)
+
+        if not self.is_safe_sql(sql):
+            return f"❌ Заблокировано:\n{sql}"
+
+        # 5. выполнить
+        cur = self.conn.cursor()
+        cur.execute(sql)
+
+        columns = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()[:50]
+
+        result = f"`{sql}`\n\n"
+        result += " | ".join(columns) + "\n"
+        result += "-" * 40 + "\n"
+
+        for row in rows:
+            result += " | ".join(str(x) for x in row) + "\n"
+
+        return result
+
+    except Exception as e:
+        try:
+            fixed_sql = self.fix_sql(sql, str(e))
             cur = self.conn.cursor()
-            cur.execute(sql)
+            cur.execute(fixed_sql)
 
-            if cur.description:
-                columns = [desc[0] for desc in cur.description]
-                rows = cur.fetchall()[:50]
-                result = f"`{sql}`\n\n"
-                result += " | ".join(columns) + "\n"
-                result += "-" * 40 + "\n"
-                for row in rows:
-                    result += " | ".join(str(x) for x in row) + "\n"
-                return result
-            else:
-                self.conn.commit()
-                return f"`{sql}`\n\nВыполнено успешно."
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()[:50]
 
-        except Exception as e:
-            self.conn.rollback()
-            return f"Ошибка: {str(e)}\n\nSQL: {sql if 'sql' in locals() else 'не сгенерирован'}"
+            result = f"🔧 Fixed query:\n`{fixed_sql}`\n\n"
+            result += " | ".join(columns) + "\n"
+            result += "-" * 40 + "\n"
+
+            for row in rows:
+                result += " | ".join(str(x) for x in row) + "\n"
+
+            return result
+
+        except Exception as e2:
+            return f"❌ Ошибка:\n{str(e2)}\n\nSQL: {sql}"
+```
