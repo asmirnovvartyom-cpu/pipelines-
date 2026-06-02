@@ -7,27 +7,31 @@ import re
 class Pipeline:
     def __init__(self):
         self.name = "PostgreSQL Smart Agent"
-        self.conn = None
         self.full_schema = {}
 
     async def on_startup(self):
-        self.conn = psycopg2.connect(
+        conn = self.get_conn()
+        self.full_schema = self.load_full_schema(conn)
+        conn.close()
+
+    async def on_shutdown(self):
+        pass
+
+    # ================= CONNECTION =================
+
+    def get_conn(self):
+        return psycopg2.connect(
             dbname="p_829_1_UVAO",
             user="Natasha",
             password="",
             host="host.docker.internal",
             port=5432
         )
-        self.full_schema = self.load_full_schema()
-
-    async def on_shutdown(self):
-        if self.conn:
-            self.conn.close()
 
     # ================= SCHEMA =================
 
-    def load_full_schema(self):
-        cur = self.conn.cursor()
+    def load_full_schema(self, conn):
+        cur = conn.cursor()
         cur.execute("""
             SELECT table_name, column_name, data_type
             FROM information_schema.columns
@@ -43,7 +47,6 @@ class Pipeline:
 
         cur.close()
 
-        # чистим мусорные таблицы
         clean_schema = {}
         for t, cols in schema.items():
             if len(cols) > 2:
@@ -92,7 +95,6 @@ class Pipeline:
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # ограничиваем до 50 таблиц максимум
         top_tables = [t[0] for t in scored[:50]]
 
         if not top_tables:
@@ -107,7 +109,7 @@ class Pipeline:
             parts.append(f"{t}({', '.join(cols)})")
         return "\n".join(parts)
 
-    # ================= SQL GENERATION =================
+    # ================= SQL =================
 
     def generate_sql(self, query, schema):
         prompt = f"""
@@ -116,10 +118,10 @@ class Pipeline:
 
 ### Rules:
 - PostgreSQL 9.3
-- ONLY SELECT queries
-- NEVER use DELETE, UPDATE, INSERT
-- Use JOIN when needed
-- LIMIT 50 always
+- ONLY SELECT
+- NO DELETE/UPDATE/INSERT
+- Use JOIN if needed
+- LIMIT 50
 
 ### Task:
 {query}
@@ -140,13 +142,22 @@ SELECT
 
         sql = "SELECT " + response.json()["response"].strip()
 
-        # чистка markdown
         if "```" in sql:
             sql = re.sub(r"```.*?```", "", sql, flags=re.S)
 
         return sql.strip()
 
-    # ================= SAFETY =================
+    # ================= VALIDATION =================
+
+    def is_valid_sql(self, sql):
+        s = sql.lower()
+        if not s.startswith("select"):
+            return False
+        if "select ." in s:
+            return False
+        if " from" not in s:
+            return False
+        return True
 
     def is_safe(self, sql):
         bad = ["delete", "update", "insert", "drop", "alter"]
@@ -162,7 +173,32 @@ SELECT
         body: dict
     ) -> Union[str, Generator, Iterator]:
 
+        conn = None
+        cur = None
+
         try:
+            conn = self.get_conn()
+
+            # лечим aborted транзакции
+            try:
+                conn.rollback()
+            except:
+                pass
+
+            cur = conn.cursor()
+
+            # fallback: список таблиц
+            if "таблиц" in user_message.lower():
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema='public'
+                    ORDER BY table_name
+                    LIMIT 100;
+                """)
+                rows = cur.fetchall()
+                return "\n".join(r[0] for r in rows)
+
             user_message = self.normalize_query(user_message)
 
             tables = self.select_relevant_tables(user_message)
@@ -172,27 +208,24 @@ SELECT
 
             print("SQL:", sql)
 
-            if "select" not in sql.lower():
-                return "❌ модель не смогла построить SQL"
+            if not self.is_valid_sql(sql):
+                return f"❌ некорректный SQL:\n{sql}"
 
             if not self.is_safe(sql):
                 return "❌ Запрос заблокирован (опасная операция)"
 
-            cur = self.conn.cursor()
-
             try:
                 cur.execute(sql)
             except Exception as e:
-                # попытка авто-фикса
                 fix_prompt = f"""
-Fix this SQL for PostgreSQL:
+Fix PostgreSQL query:
 
 {sql}
 
 Error:
 {str(e)}
 
-Return only fixed SQL:
+Return only SQL:
 """
                 response = requests.post(
                     "http://host.docker.internal:11434/api/generate",
@@ -206,6 +239,10 @@ Return only fixed SQL:
 
                 fixed_sql = response.json()["response"].strip()
                 print("FIXED:", fixed_sql)
+
+                if not self.is_valid_sql(fixed_sql):
+                    return f"❌ не удалось исправить SQL:\n{fixed_sql}"
+
                 cur.execute(fixed_sql)
                 sql = fixed_sql
 
@@ -222,6 +259,10 @@ Return only fixed SQL:
             return result
 
         except Exception as e:
-            if self.conn:
-                self.conn.rollback()
             return f"Ошибка: {str(e)}"
+
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
