@@ -6,11 +6,9 @@ import re
 
 class Pipeline:
     def __init__(self):
-        self.name = "PostgreSQL PRO Agent"
+        self.name = "PostgreSQL ULTRA STABLE"
         self.schema = {}
         self.table_priority = []
-
-    # ================= INIT =================
 
     async def on_startup(self):
         conn = self.get_conn()
@@ -26,7 +24,7 @@ class Pipeline:
             host="host.docker.internal",
             port=5432
         )
-        conn.autocommit = True  # 🔥 фикс транзакций
+        conn.autocommit = True
         return conn
 
     # ================= SCHEMA =================
@@ -37,153 +35,91 @@ class Pipeline:
             SELECT table_name, column_name
             FROM information_schema.columns
             WHERE table_schema = 'public'
-            ORDER BY table_name;
         """)
-
         schema = {}
         for t, c in cur.fetchall():
             schema.setdefault(t, []).append(c)
-
         cur.close()
         return schema
 
     def detect_priority_tables(self):
         priority = []
         for t in self.schema:
-            name = t.lower()
-            if any(k in name for k in ["citizen", "person", "people", "human", "individual"]):
+            if any(k in t.lower() for k in ["citizen", "person", "human", "individual"]):
                 priority.append(t)
         return priority if priority else list(self.schema.keys())
 
     # ================= ROUTER =================
 
     def is_db_query(self, text):
-        keywords = [
-            "покажи", "найди", "записи",
-            "таблица", "база", "данные",
-            "сколько", "фамилия", "адрес"
-        ]
-        return any(k in text.lower() for k in keywords)
+        return any(k in text.lower() for k in [
+            "покажи", "найди", "записи", "таблица",
+            "база", "данные", "сколько"
+        ])
 
-    # ================= NORMALIZE =================
-
-    def normalize(self, text):
-        mapping = {
-            "люди": "citizen",
-            "человек": "citizen",
-            "призывники": "citizen",
-            "адрес": "address",
-            "документы": "document"
-        }
-
-        text = text.lower()
-
-        for k, v in mapping.items():
-            if k in text:
-                text += f" {v}"
-
-        return text
-
-    # ================= SQL GENERATION =================
+    # ================= SQL =================
 
     def generate_sql(self, query):
-        schema_text = "\n".join(
-            f"{t}({', '.join(cols[:5])})"
-            for t, cols in list(self.schema.items())[:20]
-        )
+        try:
+            prompt = f"""
+ONLY SQL. ONLY SELECT. NO TEXT.
 
-        prompt = f"""
-You are PostgreSQL expert.
-
-Schema:
-{schema_text}
-
-Rules:
-- ONLY SQL
-- ONLY SELECT
-- NO explanations
-- LIMIT 50
-- Use real table names only
-
-Task:
-{query}
+Task: {query}
 
 SQL:
 SELECT
 """
 
-        r = requests.post(
-            "http://host.docker.internal:11434/api/generate",
-            json={
-                "model": "deepseek-coder:6.7b",
-                "prompt": prompt,
-                "stream": False,
-                "temperature": 0,
-                "num_predict": 120
-            }
-        )
+            r = requests.post(
+                "http://host.docker.internal:11434/api/generate",
+                json={
+                    "model": "deepseek-coder:6.7b",
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": 0,
+                    "num_predict": 100
+                },
+                timeout=30
+            )
 
-        sql = r.json()["response"]
+            data = r.json()
 
-        # 🔥 ЖЕСТКАЯ очистка мусора
-        sql = sql.replace("<s>", "").replace("</s>", "")
-        sql = re.sub(r"Cached.*", "", sql)
-        sql = re.sub(r"```.*?```", "", sql, flags=re.S)
+            # 🔥 главный фикс
+            if "response" not in data:
+                print("OLLAMA ERROR:", data)
+                return None
 
-        match = re.search(r"(SELECT .*?)(;|\n|$)", sql, re.S | re.I)
-        if match:
-            sql = match.group(1)
-        else:
+            sql = data["response"]
+
+            # чистка
+            sql = sql.replace("<s>", "").replace("</s>", "")
+            sql = re.sub(r"```.*?```", "", sql, flags=re.S)
+
+            match = re.search(r"(SELECT .*?)(;|\n|$)", sql, re.S | re.I)
+            return match.group(1).strip() if match else None
+
+        except Exception as e:
+            print("GEN ERROR:", e)
             return None
-
-        return sql.strip()
-
-    # ================= VALIDATION =================
-
-    def is_valid(self, sql):
-        if not sql:
-            return False
-
-        s = sql.lower()
-
-        if not s.startswith("select"):
-            return False
-
-        if " from " not in s:
-            return False
-
-        tables = re.findall(r'from\s+([a-zA-Z0-9_]+)', s)
-
-        for t in tables:
-            if t not in self.schema:
-                return False
-
-        return True
 
     # ================= FALLBACK =================
 
-    def fallback_query(self, user_message):
+    def fallback(self, user_message):
         msg = user_message.lower()
+        t = self.table_priority[0]
 
-        # если спрашивают "сколько"
         if "сколько" in msg:
-            t = self.table_priority[0]
             return f"SELECT COUNT(*) FROM {t}"
 
-        # если "люди"
-        if "люди" in msg or "человек" in msg:
-            t = self.table_priority[0]
+        if "люди" in msg:
             return f"SELECT * FROM {t} LIMIT 10"
 
-        # дефолт
-        t = self.table_priority[0]
         return f"SELECT * FROM {t} LIMIT 5"
 
     # ================= MAIN =================
 
     def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict):
 
-        # 👉 НЕ БД → не трогаем
         if not self.is_db_query(user_message):
             return None
 
@@ -191,27 +127,23 @@ SELECT
             conn = self.get_conn()
             cur = conn.cursor()
 
-            # список таблиц
             if "таблиц" in user_message.lower():
                 cur.execute("""
                     SELECT table_name
                     FROM information_schema.tables
                     WHERE table_schema='public'
-                    LIMIT 100
                 """)
                 res = "\n".join(r[0] for r in cur.fetchall())
                 cur.close()
                 conn.close()
                 return res
 
-            user_message = self.normalize(user_message)
-
             sql = self.generate_sql(user_message)
 
-            if not self.is_valid(sql):
-                sql = self.fallback_query(user_message)
+            if not sql:
+                sql = self.fallback(user_message)
 
-            print("FINAL SQL:", sql)
+            print("SQL:", sql)
 
             cur.execute(sql)
 
@@ -220,7 +152,7 @@ SELECT
 
             result = f"`{sql}`\n\n"
             result += " | ".join(cols) + "\n"
-            result += "-" * 50 + "\n"
+            result += "-" * 40 + "\n"
 
             for r in rows[:50]:
                 result += " | ".join(str(x) for x in r) + "\n"
