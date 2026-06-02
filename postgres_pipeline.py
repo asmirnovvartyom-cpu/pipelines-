@@ -3,248 +3,225 @@ import psycopg2
 import requests
 import re
 
+
 class Pipeline:
-def **init**(self):
-self.name = "PostgreSQL Smart Agent"
-self.conn = None
-self.full_schema = None
+    def __init__(self):
+        self.name = "PostgreSQL Smart Agent"
+        self.conn = None
+        self.full_schema = {}
 
-```
-async def on_startup(self):
-    self.conn = psycopg2.connect(
-        dbname="p_829_1_UVAO",
-        user="Natasha",
-        password="",
-        host="host.docker.internal",
-        port=5432
-    )
-    self.full_schema = self.load_full_schema()
+    async def on_startup(self):
+        self.conn = psycopg2.connect(
+            dbname="p_829_1_UVAO",
+            user="Natasha",
+            password="",
+            host="host.docker.internal",
+            port=5432
+        )
+        self.full_schema = self.load_full_schema()
 
-async def on_shutdown(self):
-    if self.conn:
-        self.conn.close()
+    async def on_shutdown(self):
+        if self.conn:
+            self.conn.close()
 
-# ---------- SCHEMA ----------
-def load_full_schema(self):
-    cur = self.conn.cursor()
-    cur.execute("""
-        SELECT table_name, column_name, data_type
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-        ORDER BY table_name, ordinal_position;
-    """)
+    # ================= SCHEMA =================
 
-    schema = {}
-    for table, column, dtype in cur.fetchall():
-        schema.setdefault(table, []).append(f"{column}({dtype})")
+    def load_full_schema(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            AND table_name NOT LIKE 'pg_%'
+            AND table_name NOT LIKE 'sql_%'
+            ORDER BY table_name, ordinal_position;
+        """)
 
-    cur.close()
-    return schema
+        schema = {}
+        for table, column, dtype in cur.fetchall():
+            schema.setdefault(table, set()).add(f"{column}({dtype})")
 
-def format_schema(self, tables):
-    result = []
-    for t in tables:
-        if t in self.full_schema:
-            cols = ", ".join(self.full_schema[t][:20])
-            result.append(f"{t}: {cols}")
-    return "\n".join(result)
+        cur.close()
 
-# ---------- TABLE SELECTION ----------
-def select_relevant_tables(self, user_query):
-    tables = list(self.full_schema.keys())[:100]
+        # чистим мусорные таблицы
+        clean_schema = {}
+        for t, cols in schema.items():
+            if len(cols) > 2:
+                clean_schema[t] = list(cols)
 
-    prompt = f"""
-```
+        return clean_schema
 
-You are a database expert.
+    # ================= NORMALIZATION =================
 
-Tables:
-{", ".join(tables)}
-
-User question:
-{user_query}
-
-Return ONLY a comma separated list of table names that are relevant.
-"""
-
-```
-    response = requests.post(
-        "http://host.docker.internal:11434/api/generate",
-        json={
-            "model": "sqlcoder:7b",
-            "prompt": prompt,
-            "stream": False,
-            "temperature": 0.0
+    def normalize_query(self, text):
+        mapping = {
+            "люди": "citizens",
+            "человек": "citizens",
+            "призывники": "priz",
+            "адрес": "adres",
+            "документы": "documents"
         }
-    )
 
-    text = response.json()["response"].lower()
-    selected = []
+        text_lower = text.lower()
 
-    for t in tables:
-        if t.lower() in text:
-            selected.append(t)
+        for k, v in mapping.items():
+            if k in text_lower:
+                text_lower += f" (table hint: {v})"
 
-    return selected[:5] if selected else tables[:3]
+        return text_lower
 
-# ---------- SAMPLE DATA ----------
-def get_sample_data(self, tables):
-    cur = self.conn.cursor()
-    samples = []
+    # ================= TABLE SELECTION =================
 
-    for t in tables[:3]:
-        try:
-            cur.execute(f"SELECT * FROM {t} LIMIT 3;")
-            rows = cur.fetchall()
-            samples.append(f"{t} sample: {rows}")
-        except:
-            continue
+    def select_relevant_tables(self, query):
+        query_words = set(query.lower().split())
 
-    cur.close()
-    return "\n".join(samples)
+        scored = []
+        for table, cols in self.full_schema.items():
+            score = 0
 
-# ---------- SQL GENERATION ----------
-def generate_sql(self, user_query, schema, samples):
-    prompt = f"""
-```
+            if table.lower() in query.lower():
+                score += 3
 
-You are a PostgreSQL expert.
+            for col in cols:
+                col_name = col.split("(")[0]
+                if col_name.lower() in query_words:
+                    score += 1
 
-Schema:
+            if score > 0:
+                scored.append((table, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # ограничиваем до 50 таблиц максимум
+        top_tables = [t[0] for t in scored[:50]]
+
+        if not top_tables:
+            top_tables = list(self.full_schema.keys())[:20]
+
+        return top_tables
+
+    def build_schema_prompt(self, tables):
+        parts = []
+        for t in tables:
+            cols = self.full_schema[t][:15]
+            parts.append(f"{t}({', '.join(cols)})")
+        return "\n".join(parts)
+
+    # ================= SQL GENERATION =================
+
+    def generate_sql(self, query, schema):
+        prompt = f"""
+### Database schema:
 {schema}
 
-Samples:
-{samples}
+### Rules:
+- PostgreSQL 9.3
+- ONLY SELECT queries
+- NEVER use DELETE, UPDATE, INSERT
+- Use JOIN when needed
+- LIMIT 50 always
 
-Rules:
+### Task:
+{query}
 
-* ONLY SELECT
-* NO DELETE, UPDATE, INSERT
-* Use JOIN explicitly
-* Use LIMIT 50
-* PostgreSQL 9.3
-
-User question:
-{user_query}
-
-SQL:
+### SQL:
 SELECT
 """
 
-````
-    response = requests.post(
-        "http://host.docker.internal:11434/api/generate",
-        json={
-            "model": "sqlcoder:7b",
-            "prompt": prompt,
-            "stream": False,
-            "temperature": 0.0
-        }
-    )
+        response = requests.post(
+            "http://host.docker.internal:11434/api/generate",
+            json={
+                "model": "sqlcoder:7b",
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.0
+            }
+        )
 
-    sql = "SELECT " + response.json()["response"].strip()
+        sql = "SELECT " + response.json()["response"].strip()
 
-    if "```" in sql:
-        sql = sql.split("```")[1]
+        # чистка markdown
+        if "```" in sql:
+            sql = re.sub(r"```.*?```", "", sql, flags=re.S)
 
-    return sql.strip()
+        return sql.strip()
 
-# ---------- VALIDATION ----------
-def is_safe_sql(self, sql):
-    banned = ["insert", "update", "delete", "drop", "alter"]
-    sql_lower = sql.lower()
-    return not any(b in sql_lower for b in banned)
+    # ================= SAFETY =================
 
-# ---------- AUTO FIX ----------
-def fix_sql(self, bad_sql, error):
-    prompt = f"""
-````
+    def is_safe(self, sql):
+        bad = ["delete", "update", "insert", "drop", "alter"]
+        return not any(b in sql.lower() for b in bad)
 
-Fix this PostgreSQL query.
+    # ================= MAIN =================
 
-Query:
-{bad_sql}
+    def pipe(
+        self,
+        user_message: str,
+        model_id: str,
+        messages: List[dict],
+        body: dict
+    ) -> Union[str, Generator, Iterator]:
+
+        try:
+            user_message = self.normalize_query(user_message)
+
+            tables = self.select_relevant_tables(user_message)
+            schema = self.build_schema_prompt(tables)
+
+            sql = self.generate_sql(user_message, schema)
+
+            print("SQL:", sql)
+
+            if "select" not in sql.lower():
+                return "❌ модель не смогла построить SQL"
+
+            if not self.is_safe(sql):
+                return "❌ Запрос заблокирован (опасная операция)"
+
+            cur = self.conn.cursor()
+
+            try:
+                cur.execute(sql)
+            except Exception as e:
+                # попытка авто-фикса
+                fix_prompt = f"""
+Fix this SQL for PostgreSQL:
+
+{sql}
 
 Error:
-{error}
+{str(e)}
 
-Return ONLY fixed SQL:
+Return only fixed SQL:
 """
+                response = requests.post(
+                    "http://host.docker.internal:11434/api/generate",
+                    json={
+                        "model": "sqlcoder:7b",
+                        "prompt": fix_prompt,
+                        "stream": False,
+                        "temperature": 0.0
+                    }
+                )
 
-```
-    response = requests.post(
-        "http://host.docker.internal:11434/api/generate",
-        json={
-            "model": "sqlcoder:7b",
-            "prompt": prompt,
-            "stream": False,
-            "temperature": 0.0
-        }
-    )
-
-    return response.json()["response"].strip()
-
-# ---------- MAIN PIPE ----------
-def pipe(
-    self,
-    user_message: str,
-    model_id: str,
-    messages: List[dict],
-    body: dict
-) -> Union[str, Generator, Iterator]:
-
-    try:
-        # 1. найти таблицы
-        tables = self.select_relevant_tables(user_message)
-
-        # 2. собрать схему
-        schema = self.format_schema(tables)
-
-        # 3. взять примеры данных
-        samples = self.get_sample_data(tables)
-
-        # 4. сгенерить SQL
-        sql = self.generate_sql(user_message, schema, samples)
-
-        print("SQL:", sql)
-
-        if not self.is_safe_sql(sql):
-            return f"❌ Заблокировано:\n{sql}"
-
-        # 5. выполнить
-        cur = self.conn.cursor()
-        cur.execute(sql)
-
-        columns = [desc[0] for desc in cur.description]
-        rows = cur.fetchall()[:50]
-
-        result = f"`{sql}`\n\n"
-        result += " | ".join(columns) + "\n"
-        result += "-" * 40 + "\n"
-
-        for row in rows:
-            result += " | ".join(str(x) for x in row) + "\n"
-
-        return result
-
-    except Exception as e:
-        try:
-            fixed_sql = self.fix_sql(sql, str(e))
-            cur = self.conn.cursor()
-            cur.execute(fixed_sql)
+                fixed_sql = response.json()["response"].strip()
+                print("FIXED:", fixed_sql)
+                cur.execute(fixed_sql)
+                sql = fixed_sql
 
             columns = [desc[0] for desc in cur.description]
             rows = cur.fetchall()[:50]
 
-            result = f"🔧 Fixed query:\n`{fixed_sql}`\n\n"
+            result = f"`{sql}`\n\n"
             result += " | ".join(columns) + "\n"
-            result += "-" * 40 + "\n"
+            result += "-" * 50 + "\n"
 
-            for row in rows:
-                result += " | ".join(str(x) for x in row) + "\n"
+            for r in rows:
+                result += " | ".join(str(x) for x in r) + "\n"
 
             return result
 
-        except Exception as e2:
-            return f"❌ Ошибка:\n{str(e2)}\n\nSQL: {sql}"
-```
+        except Exception as e:
+            if self.conn:
+                self.conn.rollback()
+            return f"Ошибка: {str(e)}"
