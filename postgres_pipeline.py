@@ -52,7 +52,7 @@ DB_CONFIG = {
 }
 
 OLLAMA_URL = "http://host.docker.internal:11434"
-MODEL = "qwen2.5-coder:14b"
+MODEL = "qwen2.5-coder:14b-instruct-q4_K_M"
 
 # Запрещённые операции
 FORBIDDEN = ["DROP ", "TRUNCATE ", "ALTER ", "CREATE ", "GRANT ", "REVOKE "]
